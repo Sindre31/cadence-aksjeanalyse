@@ -1,0 +1,52 @@
+name: Refresh market data
+
+on:
+  schedule:
+    - cron: "45 3 * * 2-6"   # Tue–Sat 03:45 UTC, after Oslo close data settles
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  refresh:
+    runs-on: ubuntu-latest
+    timeout-minutes: 110
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install dependencies
+        run: pip install yfinance numpy pandas lxml
+
+      - name: Fetch Nordnet + Yahoo data
+        run: python scripts/fetch_data.py
+
+      - name: Quality gate
+        run: |
+          python - <<'EOF'
+          import json, sys
+          from pathlib import Path
+          cat = json.loads(Path("public/data/catalog.json").read_text())
+          meta = json.loads(Path("public/data/meta.json").read_text())
+          a = list(Path("public/data/a").glob("*.json"))
+          assert len(cat) > 10000, f"catalog too thin: {len(cat)}"
+          assert meta["counts"]["funds"] > 500, "funds missing"
+          assert len(a) > 400, f"analytics too thin: {len(a)}"
+          assert Path("public/data/a/OSEBX.json").exists(), "index analytics missing"
+          osebx = json.loads(Path("public/data/a/OSEBX.json").read_text())
+          assert osebx["tf"].get("3Y", {}).get("matrix"), "index heatmap missing"
+          print(f"OK: catalog {len(cat)}, analytics {len(a)}")
+          EOF
+
+      - name: Commit & push
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add public/data
+          git diff --cached --quiet && echo "no changes" && exit 0
+          git commit -m "data: nightly refresh $(date -u +%F)"
+          git push
