@@ -150,8 +150,14 @@ body {
 .heat-cell:hover { transform:scale(1.06); box-shadow:0 0 0 2px color-mix(in oklab,var(--accent) 70%, transparent), 0 8px 18px rgba(0,0,0,.35); z-index:2; }
 .heat-val { font-family:var(--mono); font-size:12px; font-weight:600; color:#fff; mix-blend-mode:luminosity; opacity:.92; }
 [data-theme="nordic"] .heat-val { color:#0b1a12; mix-blend-mode:normal; }
-.heat-legend { display:flex; align-items:center; gap:10px; margin-top:14px; color:var(--faint); font-size:11px; font-family:var(--mono); }
-.heat-ramp { flex:1; height:8px; border-radius:5px; background:linear-gradient(90deg, var(--heat-neg), var(--heat-mid), var(--heat-pos)); }
+.heat-cell.weak { opacity:.45; }
+.heat-cell.weak:hover { opacity:1; }
+.heat-cell.now { box-shadow:0 0 0 2px var(--accent), 0 0 14px color-mix(in oklab,var(--accent) 45%, transparent); z-index:1; }
+.heat-flag { color:var(--neg); font-size:8px; margin-right:5px; }
+.heat-legend { display:flex; align-items:center; gap:10px; margin-top:14px; color:var(--faint); font-size:11px; font-family:var(--mono); flex-wrap:wrap; }
+.heat-ramp { flex:1; height:8px; border-radius:5px; min-width:120px; background:linear-gradient(90deg, var(--heat-neg), var(--heat-mid), var(--heat-pos)); }
+.heat-legend-note { white-space:nowrap; }
+.heat-flag-note { color:var(--neg); }
 
 /* ---- bars ---- */
 .bars { display:flex; flex-direction:column; gap:9px; position:relative; }
@@ -227,6 +233,14 @@ body {
 .earn-peak { font-family:var(--mono); font-size:12px; font-weight:600; color:var(--accent);
   background:color-mix(in oklab,var(--accent) 16%, var(--surface2)); border:1px solid color-mix(in oklab,var(--accent) 30%, transparent);
   padding:4px 9px; border-radius:7px; }
+
+/* ---- post-earnings drift ---- */
+.pead { margin-top:18px; border-top:1px solid var(--line); padding-top:14px; }
+.pead-title { font-family:var(--mono); font-size:11px; color:var(--faint); text-transform:uppercase; letter-spacing:.07em; margin-bottom:8px; }
+
+/* ---- "right now" hero chip tones ---- */
+.hw-val.good { color:var(--pos); }
+.hw-val.bad { color:var(--neg); }
 
 /* ---- curve ---- */
 .curve { position:relative; }

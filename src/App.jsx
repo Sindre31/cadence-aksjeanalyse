@@ -1,7 +1,7 @@
 /* Cadence — main dashboard app */
 import React, { useState, useEffect, useMemo, useRef } from 'react';
 import {
-  Heatmap, BarChart, ColumnChart, IntradayCurve, Gauge, StatChip, EarningsChart, fmtPct,
+  Heatmap, BarChart, ColumnChart, IntradayCurve, Gauge, StatChip, EarningsChart, PeadCurve, fmtPct,
 } from './charts.jsx';
 import {
   loadMeta, loadCatalog, fetchAnalytics, fetchDetail, searchCatalog, buildView,
@@ -113,6 +113,35 @@ function InstrumentPicker({ current, onChange }) {
   );
 }
 
+/* ---- where are we in the heatmap right now? (exchange-local time) --------- */
+function nowInfo(view) {
+  if (!view || !view.matrix || !view.instrument.tz) return null;
+  let parts;
+  try {
+    parts = new Intl.DateTimeFormat('en-GB', {
+      timeZone: view.instrument.tz, weekday: 'short', hour: '2-digit', hourCycle: 'h23',
+    }).formatToParts(new Date());
+  } catch {
+    return null;
+  }
+  const wd = parts.find(p => p.type === 'weekday')?.value;
+  const hh = parts.find(p => p.type === 'hour')?.value;
+  const di = view.daysAxis.indexOf(wd);
+  const hi = view.hoursAxis.indexOf(hh);
+  if (di < 0 || hi < 0) return { closed: true };
+  const c = view.matrix[di][hi];
+  return { di, hi, day: wd, hour: hh, edge: c.e, weak: Math.abs(c.t) < 1 };
+}
+
+/* ---- upcoming report-day flag for the heatmap ------------------------------ */
+function reportFlag(view) {
+  const e = view && view.earnings;
+  if (!e || e.kind !== 'stock' || !e.next || e.next.daysUntil > 10) return null;
+  const d = new Date(e.next.iso).getDay();
+  if (d < 1 || d > 5) return null;
+  return { di: d - 1, label: `${e.next.label} report lands here — ${e.next.date} (in ${e.next.daysUntil} days)` };
+}
+
 function VerdictPill({ verdict }) {
   const cls = verdict === 'BUY' ? 'buy' : verdict === 'SELL' ? 'sell' : 'wait';
   return <span className={'verdict ' + cls}>{verdict}</span>;
@@ -173,6 +202,12 @@ function EarningsSection({ view }) {
             <span><i className="sw elevated"></i> elevated after</span>
             <span><i className="sw base"></i> before / normal</span>
           </div>
+          {e.pead && (
+            <div className="pead">
+              <div className="pead-title">Post-earnings drift — cumulative avg return after the print</div>
+              <PeadCurve pead={e.pead} />
+            </div>
+          )}
         </div>
         <div className="earn-side">
           <div className={'earn-next' + (verdictClose ? ' soon' : '')}>
@@ -205,8 +240,9 @@ const Y_LABELS = [
   ['yield_1y', '1Y'], ['yield_3y', '3Y'], ['yield_5y', '5Y'], ['yield_10y', '10Y'],
 ];
 
-function SummaryView({ detail }) {
+function SummaryView({ detail, season }) {
   const isFund = detail.type === 'FND';
+  const bestSeason = season && season.month && season.month.reduce((a, b) => (b.ret > a.ret ? b : a));
   const rows = Y_LABELS
     .filter(([k]) => typeof detail.y?.[k] === 'number')
     .map(([k, label]) => ({ key: label, ret: detail.y[k] }));
@@ -242,6 +278,14 @@ function SummaryView({ detail }) {
           <BarChart rows={rows} metric="ret"
                     highlightKey={rows.reduce((a, b) => (b.ret > a.ret ? b : a)).key}
                     tipOf={(r) => <span><b>{r.key}</b><br />{fmtPct(r.ret, true)}</span>} />
+        </Card>
+      )}
+
+      {bestSeason && (
+        <Card title="Seasonality" sub={`Average NAV return by calendar month — last ${season.years} years (Yahoo)`}
+              span={8} hint={`momentum 12m ${fmtPct(season.momentum.m12, true)}`}>
+          <ColumnChart rows={season.month} metric="ret" highlightKey={bestSeason.key}
+                       tipOf={(r) => <span><b>{r.key}</b><br />avg month {fmtPct(r.ret, true)}<br />win {r.winRate}% · n={r.n}{Math.abs(r.t) < 1 ? <><br />weak signal</> : null}</span>} />
         </Card>
       )}
 
@@ -313,13 +357,14 @@ export default function App() {
       try {
         const a = await fetchAnalytics(sel.id);
         if (!alive) return;
-        if (a) { setData(a); setDetail(null); }
+        if (a && a.instrument.kind !== 'fund') { setData(a); setDetail(null); }
         else {
+          // funds (with or without seasonality) and the long tail use the summary view
           const d = await fetchDetail(sel.id);
           if (!alive) return;
-          setData(null);
+          setData(a);
           setDetail(d);
-          if (!d) setError('Instrument not found in the dataset.');
+          if (!d && !a) setError('Instrument not found in the dataset.');
         }
       } catch (e) {
         if (alive) setError(String(e));
@@ -339,8 +384,18 @@ export default function App() {
     window.history.replaceState(null, '', qs ? `?${qs}` : window.location.pathname);
   }, [sel.id, tf]);
 
-  const view = useMemo(() => (data ? buildView(data, tf) : null), [data, tf]);
+  // tick every minute so the "now" marker tracks the clock
+  const [, setTick] = useState(0);
+  useEffect(() => {
+    const iv = setInterval(() => setTick(t => t + 1), 60000);
+    return () => clearInterval(iv);
+  }, []);
+
+  const isFund = data && data.instrument.kind === 'fund';
+  const view = useMemo(() => (data && !isFund ? buildView(data, tf) : null), [data, isFund, tf]);
   const rec = view && view.recommendation;
+  const now = view && nowInfo(view);
+  const report = view && reportFlag(view);
   const asOfIso = (view && view.asOf) || (meta && meta.asOf);
   const asOf = asOfIso && new Date(asOfIso).toLocaleDateString('en-GB', { day: '2-digit', month: 'short', year: 'numeric' });
 
@@ -375,7 +430,7 @@ export default function App() {
       </header>
 
       {error && !view && !detail && <p className="err">{error}</p>}
-      {!view && detail && <SummaryView detail={detail} />}
+      {!view && detail && <SummaryView detail={detail} season={isFund ? data : null} />}
 
       {view && (
         <main className="grid">
@@ -405,6 +460,19 @@ export default function App() {
                   <span className="hw-lbl">3-month momentum</span>
                   <span className={'hw-val' + (view.momentum.m3 >= 0 ? '' : ' muted')}>{fmtPct(view.momentum.m3, true)}</span>
                 </div>
+                {now && (
+                  <>
+                    <div className="hw-sep"></div>
+                    <div className="hw-item">
+                      <span className="hw-lbl">Right now</span>
+                      {now.closed
+                        ? <span className="hw-val muted">Market closed</span>
+                        : <span className={'hw-val' + (now.weak ? ' muted' : now.edge >= 60 ? ' good' : now.edge <= 40 ? ' bad' : '')}>
+                            {now.day} · {now.hour}:00 — edge {now.edge}{now.weak ? ' (weak)' : ''}
+                          </span>}
+                    </div>
+                  </>
+                )}
               </div>
               <ul className="hero-rationale">
                 {rec.rationale.map((r, i) => <li key={i}>{r}</li>)}
@@ -427,7 +495,8 @@ export default function App() {
           {view.matrix && (
             <Card title="When to trade" sub={`Edge score by weekday × hour (exchange local time) — intraday sample: ${view.intradayDays} sessions`}
                   hint="0 = weak · 100 = strong" span={12}>
-              <Heatmap matrix={view.matrix} daysAxis={view.daysAxis} hoursAxis={view.hoursAxis} />
+              <Heatmap matrix={view.matrix} daysAxis={view.daysAxis} hoursAxis={view.hoursAxis}
+                       now={now && !now.closed ? now : null} report={report} />
             </Card>
           )}
 
@@ -456,9 +525,9 @@ export default function App() {
             <BarChart rows={view.weekday} metric="ret" highlightKey={view.bestDay.key} />
           </Card>
 
-          {/* ---- volume / liquidity ---- */}
-          {view.hour && (
-            <Card title="Liquidity" sub="Relative volume by hour" span={4}>
+          {/* ---- volume / liquidity (hidden when no volume data, e.g. indices) ---- */}
+          {view.hour && view.hour.some(r => r.volume > 0) && (
+            <Card title="Liquidity" sub="Relative volume by hour (median, log scale)" span={4}>
               <BarChart rows={view.hour} metric="volume" unit="" highlightKey={view.bestHour && view.bestHour.key} max={100} />
             </Card>
           )}

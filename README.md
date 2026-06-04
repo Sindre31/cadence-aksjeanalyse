@@ -14,19 +14,27 @@ Built from a Claude Design handoff (`Trading Timing Dashboard.html`, project
   ETFs, OSEBX index), ranked by relevance then Nordnet owner count.
   Timeframes 1Y / 3Y / 5Y.
 - **Recommendation hero** — BUY / SELL / WAIT with confidence gauge, best/worst
-  trading window, 3-month momentum and an earnings-aware rationale.
+  trading window, 3-month momentum, a live **"right now"** read of the current
+  trading window (exchange-local clock) and an earnings-aware rationale.
 - **"When to trade" heatmap** — the signature: edge score per weekday × hour,
   computed from real Yahoo hourly bars (up to 730 days, exchange-local time).
+  Cells whose mean return is statistically indistinguishable from noise
+  (|t| < 1) are dimmed; the current window is outlined; an upcoming report
+  day (≤10 days) is flagged ● on its weekday.
 - **Around earnings** — volatility & drift in the sessions around quarterly
-  reports (real report dates), next-report countdown; for the OSEBX index a
+  reports (real report dates), **post-earnings drift (PEAD)** cumulative curve
+  for +1…+10 sessions, next-report countdown; for the OSEBX index a
   reporting-season load chart instead.
 - **Cards** — best weekday, time-of-day curve, seasonality, average return,
-  liquidity by hour, volatility by month.
+  liquidity by hour (median per bucket, log-scaled so the closing auction
+  doesn't flatten the chart), volatility by month.
 - **Funds** — price once a day at NAV, so they get Nordnet's return summary,
-  fee, Morningstar rating, KIID risk, AUM and SFDR instead of intraday timing.
+  fee, Morningstar rating, KIID risk, AUM and SFDR — plus **NAV seasonality**
+  (average return by calendar month, 10y) for the 250 most-owned funds.
 - **Edge score** = within-instrument blend of mean return (50%), win rate
   (32%), liquidity (18%) minus a volatility penalty, scaled 0–100 — with an
-  honest disclaimer that patterns are not forecasts.
+  honest disclaimer that patterns are not forecasts. Bucket tooltips carry
+  n and the t-statistic.
 
 Three visual directions from the design live behind the theme toggle:
 **Navy / Terminal / Light Nordic**.
@@ -54,10 +62,15 @@ public/data/
 - **Nordnet public API** — full instrument lists (`instrument_search`
   stocklist / fundlist / etflist, all exchanges), prices, owner counts, key
   ratios, fund facts and return summaries.
-- **Yahoo Finance** — 5y daily history and 730d hourly bars (tz-converted to
-  each exchange's local time) for the analytics universe: **all Oslo Børs
-  shares + the 400 most-owned foreign shares + 100 most-owned ETFs + OSEBX/OBX**;
-  earnings dates for the 150 most-owned stocks.
+- **Yahoo Finance** — two analytics tiers:
+  - **Hourly tier** (full heatmap): 5y daily + 730d hourly bars (tz-converted
+    to each exchange's local time) for **all Oslo Børs shares + the 400
+    most-owned foreign shares + 100 most-owned ETFs + OSEBX/OBX**.
+  - **Daily tier** (weekday/seasonality, no hour dimension): 5y daily bars for
+    every other foreign share with ≥25 Nordnet owners (up to 4,000) and every
+    other ETF with ≥10 owners (up to 800).
+  - Earnings dates for the 500 most-owned stocks; monthly NAV (10y, resolved
+    via ISIN, price-validated ±15%) for the 250 most-owned funds.
 - Verdicts: BUY/SELL/WAIT from 3m/12m momentum and win-rate consistency; a
   report due within 5 sessions forces WAIT.
 

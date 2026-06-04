@@ -33,9 +33,14 @@ NN = "https://www.nordnet.no/api/2"
 HDRS = {"Accept": "application/json", "client-id": "NEXT",
         "User-Agent": "Mozilla/5.0 (compatible; cadence/1.0; personal project)"}
 
-FOREIGN_TOP = 400        # most-owned foreign shares to give full analytics
-ETF_TOP = 100            # most-owned ETFs to give full analytics
-EARNINGS_TOP = 150       # most-owned analytics stocks to fetch earnings dates for
+FOREIGN_TOP = 400        # most-owned foreign shares to give full (intraday) analytics
+ETF_TOP = 100            # most-owned ETFs to give full (intraday) analytics
+DAILY_MIN_OWNERS = 25    # foreign shares below FOREIGN_TOP get daily-only analytics from this
+ETF_DAILY_MIN_OWNERS = 10
+DAILY_FOREIGN_MAX = 4000
+DAILY_ETF_MAX = 800
+EARNINGS_TOP = 500       # most-owned analytics stocks to fetch earnings dates for
+FUND_HIST_MAX = 250      # most-owned funds to resolve monthly NAV history for (via ISIN)
 SHARDS = 256
 DAYS = ["Mon", "Tue", "Wed", "Thu", "Fri"]
 MONTHS = ["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"]
@@ -194,11 +199,14 @@ for r in etfs_raw:
     ))
 
 # ---------------- 2. analytics universe ----------------
+# hourly tier: full intraday analytics (weekday × hour heatmap)
 no_shares = [s for s in shares if s["country"] == "NO" and s["yt"]]
-foreign = sorted([s for s in shares if s["country"] != "NO" and s["yt"] and (s["owners"] or 0) > 0],
-                 key=lambda s: s["owners"] or 0, reverse=True)[:FOREIGN_TOP]
-etf_top = sorted([e for e in etfs if e["yt"] and (e["owners"] or 0) > 0],
-                 key=lambda e: e["owners"] or 0, reverse=True)[:ETF_TOP]
+foreign_sorted = sorted([s for s in shares if s["country"] != "NO" and s["yt"] and (s["owners"] or 0) > 0],
+                        key=lambda s: s["owners"] or 0, reverse=True)
+foreign = foreign_sorted[:FOREIGN_TOP]
+etf_sorted = sorted([e for e in etfs if e["yt"] and (e["owners"] or 0) > 0],
+                    key=lambda e: e["owners"] or 0, reverse=True)
+etf_top = etf_sorted[:ETF_TOP]
 universe = ([dict(s, kind="stock") for s in no_shares]
             + [dict(s, kind="stock") for s in foreign]
             + [dict(e, kind="etf") for e in etf_top])
@@ -210,8 +218,22 @@ for s in universe:
     seen_yt.add(s["yt"])
     uni.append(s)
 universe = uni
-log(f"analytics universe: {len(no_shares)} NO + {len(foreign)} foreign + {len(etf_top)} ETF "
-    f"= {len(universe)} after de-dup")
+
+# daily tier: the long tail gets weekday/seasonality analytics from daily bars only
+daily_tier = ([dict(s, kind="stock") for s in foreign_sorted[FOREIGN_TOP:]
+               if (s["owners"] or 0) >= DAILY_MIN_OWNERS][:DAILY_FOREIGN_MAX]
+              + [dict(e, kind="etf") for e in etf_sorted[ETF_TOP:]
+                 if (e["owners"] or 0) >= ETF_DAILY_MIN_OWNERS][:DAILY_ETF_MAX])
+dt_uni = []
+for s in daily_tier:
+    if s["yt"] in seen_yt:
+        continue
+    seen_yt.add(s["yt"])
+    dt_uni.append(s)
+daily_tier = dt_uni
+combined = universe + daily_tier
+log(f"analytics universe: {len(no_shares)} NO + {len(foreign)} foreign + {len(etf_top)} ETF hourly tier "
+    f"({len(universe)} after de-dup) + {len(daily_tier)} daily tier = {len(combined)}")
 
 # index pseudo-instrument
 INDEX = dict(id="OSEBX", sym="OSEBX", name="Oslo Børs Benchmark", country="NO",
@@ -229,26 +251,95 @@ for c in ["OBX.OL", "^OSEAX"]:
 if not INDEX["yt"]:
     raise SystemExit("no index ticker worked")
 
-# ---------------- 3. daily history (5y) ----------------
-all_ts = [s["yt"] for s in universe] + [INDEX["yt"]]
+# ---------------- 3. hourly history (730d, per-country chunks for tz) --------
+# Runs BEFORE the long-tail daily download: the heatmap tier matters most, so it
+# gets first claim on Yahoo's rate budget. A repair pass retries stragglers.
+log("downloading hourly history (730d)...")
+hourly = {}   # yt -> DataFrame [Open, Close, Volume] tz-localized to exchange
+country_of = {}
+for s in universe + [dict(INDEX, country="NO")]:
+    country_of[s["yt"]] = s["country"]
+
+
+def dl_hourly(ts, tz, label):
+    log(f"  hourly {label} ({len(ts)})")
+    h = None
+    for attempt in range(2):
+        try:
+            h = yf.download(ts, period="730d", interval="1h", auto_adjust=True,
+                            progress=False, threads=True, group_by="ticker")
+            break
+        except Exception as e:
+            log(f"    failed: {e} — backing off 60s")
+            time.sleep(60)
+    if h is None or h.empty:
+        return
+    single = not isinstance(h.columns, pd.MultiIndex)
+    for t in ts:
+        try:
+            d = h if single else h[t]
+            d = d[["Open", "Close", "Volume"]].dropna(subset=["Close"])
+        except Exception:
+            continue
+        if len(d) < 200:
+            continue
+        try:
+            idx = d.index.tz_convert(tz)
+        except TypeError:
+            idx = d.index.tz_localize("UTC").tz_convert(tz)
+        d = d.copy()
+        d.index = idx
+        hourly[t] = d
+    time.sleep(2)
+
+
+by_country = {}
+for t, c in country_of.items():
+    by_country.setdefault(c, []).append(t)
+HCH = 80
+for country, ts_all in sorted(by_country.items(), key=lambda kv: -len(kv[1])):
+    tz = TZ.get(country)
+    if not tz:
+        continue
+    for i in range(0, len(ts_all), HCH):
+        dl_hourly(ts_all[i:i + HCH], tz,
+                  f"{country} chunk {i // HCH + 1}/{(len(ts_all) + HCH - 1) // HCH}")
+
+# repair passes: smaller chunks for whatever the throttle dropped
+for rp in range(2):
+    missing = [t for t, c in country_of.items() if t not in hourly and TZ.get(c)]
+    if len(missing) < 10:
+        break
+    log(f"  hourly repair pass {rp + 1}: {len(missing)} missing — backing off 90s")
+    time.sleep(90)
+    by_c = {}
+    for t in missing:
+        by_c.setdefault(country_of[t], []).append(t)
+    for country, ts_all in by_c.items():
+        for i in range(0, len(ts_all), 40):
+            dl_hourly(ts_all[i:i + 40], TZ[country], f"repair {country}")
+log(f"  hourly history: {len(hourly)} tickers")
+
+# ---------------- 4. daily history (5y) ----------------
+all_ts = [s["yt"] for s in combined] + [INDEX["yt"]]
 log(f"downloading 5y daily history for {len(all_ts)} tickers...")
 daily_px, daily_vol = {}, {}
-CH = 400
-for i in range(0, len(all_ts), CH):
-    ts = all_ts[i:i + CH]
-    log(f"  daily chunk {i // CH + 1}/{(len(all_ts) + CH - 1) // CH} ({len(ts)})")
+
+
+def dl_daily(ts, label):
+    log(f"  daily {label} ({len(ts)})")
     try:
         h = yf.download(ts, period="5y", interval="1d", auto_adjust=True,
                         progress=False, threads=True, group_by="column")
     except Exception as e:
         log(f"  chunk failed: {e}")
-        continue
+        return
     if h is None or h.empty:
-        continue
+        return
     cl = h["Close"] if "Close" in h.columns.get_level_values(0) else None
     vo = h["Volume"] if "Volume" in h.columns.get_level_values(0) else None
     if cl is None:
-        continue
+        return
     if not hasattr(cl, "columns"):
         cl = cl.to_frame(name=ts[0])
         vo = vo.to_frame(name=ts[0]) if vo is not None else None
@@ -259,52 +350,21 @@ for i in range(0, len(all_ts), CH):
             if vo is not None and t in vo.columns:
                 daily_vol[t] = vo[t].reindex(col.index)
     time.sleep(1)
-log(f"  daily history: {len(daily_px)} tickers")
 
-# ---------------- 4. hourly history (730d, per-country chunks for tz) ----------------
-log("downloading hourly history (730d)...")
-hourly = {}   # yt -> DataFrame [Open, Close, Volume] tz-localized to exchange
-by_country = {}
-for s in universe + [dict(INDEX, country="NO")]:
-    if s["yt"] in daily_px:
-        by_country.setdefault(s["country"], []).append(s["yt"])
-HCH = 80
-for country, ts_all in sorted(by_country.items(), key=lambda kv: -len(kv[1])):
-    tz = TZ.get(country)
-    if not tz:
-        continue
-    for i in range(0, len(ts_all), HCH):
-        ts = ts_all[i:i + HCH]
-        log(f"  hourly {country} chunk {i // HCH + 1}/{(len(ts_all) + HCH - 1) // HCH} ({len(ts)})")
-        h = None
-        for attempt in range(2):
-            try:
-                h = yf.download(ts, period="730d", interval="1h", auto_adjust=True,
-                                progress=False, threads=True, group_by="ticker")
-                break
-            except Exception as e:
-                log(f"    failed: {e} — backing off 60s")
-                time.sleep(60)
-        if h is None or h.empty:
-            continue
-        single = not isinstance(h.columns, pd.MultiIndex)
-        for t in ts:
-            try:
-                d = h if single else h[t]
-                d = d[["Open", "Close", "Volume"]].dropna(subset=["Close"])
-            except Exception:
-                continue
-            if len(d) < 200:
-                continue
-            try:
-                idx = d.index.tz_convert(tz)
-            except TypeError:
-                idx = d.index.tz_localize("UTC").tz_convert(tz)
-            d = d.copy()
-            d.index = idx
-            hourly[t] = d
-        time.sleep(2)
-log(f"  hourly history: {len(hourly)} tickers")
+
+CH = 400
+for i in range(0, len(all_ts), CH):
+    dl_daily(all_ts[i:i + CH], f"chunk {i // CH + 1}/{(len(all_ts) + CH - 1) // CH}")
+
+# one repair pass — hourly-tier tickers first, they carry the heatmap
+missing = ([t for t in ([s["yt"] for s in universe] + [INDEX["yt"]]) if t not in daily_px]
+           + [s["yt"] for s in daily_tier if s["yt"] not in daily_px])
+if len(missing) > 20:
+    log(f"  daily repair pass: {len(missing)} missing — backing off 60s")
+    time.sleep(60)
+    for i in range(0, len(missing), 200):
+        dl_daily(missing[i:i + 200], "repair")
+log(f"  daily history: {len(daily_px)} tickers")
 
 # ---------------- 5. earnings dates ----------------
 log("fetching earnings dates...")
@@ -355,28 +415,39 @@ def edge_scores(rows):
     return rows
 
 
+def tstat(mean, sd, n):
+    """t-statistic of the bucket mean vs zero — the signal-vs-noise flag."""
+    if sd <= 0 or n < 2:
+        return 0.0
+    return round(float(mean / (sd / math.sqrt(n))), 2)
+
+
 def bucket_stats(rets, vols, keys, order):
-    """Aggregate return/volume series grouped by key -> design bucket rows."""
+    """Aggregate return/volume series grouped by key -> design bucket rows.
+    Volume uses the MEDIAN per bucket (robust to auction spikes) and is
+    log-scaled 0..100 so the closing auction doesn't flatten everything else."""
     rows = []
     for key in order:
         m = keys == key
         rr = rets[m]
         if len(rr) < 5:
-            rows.append(dict(key=str(key), ret=0.0, winRate=50, volume=0, vol=0.0, n=int(len(rr))))
+            rows.append(dict(key=str(key), ret=0.0, winRate=50, volume=0, vol=0.0, n=int(len(rr)), t=0.0))
             continue
         vv = vols[m]
+        mean, sd = float(rr.mean()), float(rr.std())
         rows.append(dict(
             key=str(key),
-            ret=float(round(rr.mean() * 100, 3)),
+            ret=float(round(mean * 100, 3)),
             winRate=int(round((rr > 0).mean() * 100)),
-            volume=float(vv.mean()) if len(vv) else 0.0,
-            vol=float(round(rr.std() * 100, 2)),
+            volume=float(np.median(vv)) if len(vv) else 0.0,
+            vol=float(round(sd * 100, 2)),
             n=int(len(rr)),
+            t=tstat(mean, sd, len(rr)),
         ))
-    # scale volume to 0..100 relative
+    # log-scale volume to 0..100 relative
     mx = max((r["volume"] for r in rows), default=0)
     for r in rows:
-        r["volume"] = int(round(r["volume"] / mx * 100)) if mx > 0 else 0
+        r["volume"] = int(round(math.log1p(max(0.0, r["volume"])) / math.log1p(mx) * 100)) if mx > 0 else 0
     return edge_scores(rows)
 
 
@@ -458,7 +529,7 @@ def analytics_for(s):
                                          sub["hour"].values, hh)
                 for i, row in enumerate(hour_rows):
                     row["key"] = hours_axis[i]
-                # day x hour matrix
+                # day x hour matrix — cells carry edge + signal stats for the UI
                 cells = []
                 for di in range(5):
                     for h in hh:
@@ -466,28 +537,34 @@ def analytics_for(s):
                         rr = sub["ret"].values[m]
                         vv = sub["volume"].values[m]
                         if len(rr) >= 5:
-                            cells.append(dict(ret=float(rr.mean() * 100),
+                            mean, sd = float(rr.mean()), float(rr.std())
+                            cells.append(dict(ret=mean * 100,
                                               winRate=float((rr > 0).mean() * 100),
-                                              volume=float(vv.mean()),
-                                              vol=float(rr.std() * 100)))
+                                              volume=float(np.median(vv)),
+                                              vol=sd * 100,
+                                              n=int(len(rr)), t=tstat(mean, sd, len(rr))))
                         else:
-                            cells.append(dict(ret=0.0, winRate=50.0, volume=0.0, vol=0.0))
+                            cells.append(dict(ret=0.0, winRate=50.0, volume=0.0, vol=0.0, n=int(len(rr)), t=0.0))
                 mx = max((c["volume"] for c in cells), default=0)
                 for c in cells:
-                    c["volume"] = c["volume"] / mx * 100 if mx > 0 else 0
+                    c["volume"] = math.log1p(max(0.0, c["volume"])) / math.log1p(mx) * 100 if mx > 0 else 0
                 edge_scores(cells)
-                matrix = [[cells[di * len(hh) + hi]["edge"] for hi in range(len(hh))]
+                matrix = [[dict(e=cells[di * len(hh) + hi]["edge"],
+                                ret=round(cells[di * len(hh) + hi]["ret"], 3),
+                                n=cells[di * len(hh) + hi]["n"],
+                                t=cells[di * len(hh) + hi]["t"])
+                           for hi in range(len(hh))]
                           for di in range(5)]
 
         # recommendation
         best, worst = None, None
         if matrix:
             for di, row in enumerate(matrix):
-                for hi, e in enumerate(row):
-                    if best is None or e > best["edge"]:
-                        best = dict(day=DAYS[di], hour=hours_axis[hi], edge=e)
-                    if worst is None or e < worst["edge"]:
-                        worst = dict(day=DAYS[di], hour=hours_axis[hi], edge=e)
+                for hi, c in enumerate(row):
+                    if best is None or c["e"] > best["edge"]:
+                        best = dict(day=DAYS[di], hour=hours_axis[hi], edge=c["e"])
+                    if worst is None or c["e"] < worst["edge"]:
+                        worst = dict(day=DAYS[di], hour=hours_axis[hi], edge=c["e"])
         else:
             wb = max(weekday, key=lambda r: r["edge"])
             ww = min(weekday, key=lambda r: r["edge"])
@@ -522,6 +599,7 @@ def analytics_for(s):
     return dict(
         instrument=dict(id=s["id"], name=s["name"], ticker=s.get("sym") or t,
                         kind=s["kind"], currency=s["ccy"], country=s.get("country"),
+                        tz=TZ.get(s.get("country")),
                         slug=s.get("slug"), owners=s.get("owners") or 0),
         asOf=NOW.date().isoformat(),
         momentum=dict(m3=round(mom3, 1), m12=round(mom12, 1)),
@@ -548,7 +626,7 @@ def earnings_for(s, px, dr):
         loc = idx.searchsorted(d)
         if 0 <= loc < len(idx) and abs((idx[loc] - d).days) <= 3:
             pos_of[d] = loc
-    rels = list(range(-5, 6))
+    rels = list(range(-5, 11))
     by_rel = {r: [] for r in rels}
     drv = px.pct_change().values * 100
     for d, loc in pos_of.items():
@@ -559,14 +637,19 @@ def earnings_for(s, px, dr):
             if 1 <= j < len(drv) and np.isfinite(drv[j]) and abs(drv[j]) < 30:
                 by_rel[r].append(drv[j])
     events = len([d for d in pos_of if d <= NOW])
-    drift = None
+    drift, pead = None, None
     if events >= 3:
         drift = []
-        for r in rels:
+        for r in range(-5, 6):
             vals = np.array(by_rel[r]) if by_rel[r] else np.array([0.0])
             drift.append(dict(rel=r, label="R" if r == 0 else (f"+{r}" if r > 0 else str(r)),
                               ret=float(round(vals.mean(), 2)),
                               vol=float(round(np.abs(vals).mean(), 2))))
+        # post-earnings drift: cumulative average return over the sessions after the print
+        pead, cum = [], 0.0
+        for r in range(1, 11):
+            cum += float(np.mean(by_rel[r])) if by_rel[r] else 0.0
+            pead.append(dict(rel=r, cum=round(cum, 2)))
     future = sorted([d for d in ds if d >= NOW])
     past = sorted([d for d in ds if d < NOW], reverse=True)
     nxt = None
@@ -583,7 +666,7 @@ def earnings_for(s, px, dr):
         calm = min(post, key=lambda d: d["vol"])
         early = [d for d in drift if d["rel"] in (1, 2, 3)]
         mean_post = float(np.mean([d["ret"] for d in early]))
-        out.update(drift=drift, reportDayMove=rday["vol"],
+        out.update(drift=drift, pead=pead, reportDayMove=rday["vol"],
                    postElevatedSessions=len([d for d in post if d["vol"] > base_vol * 1.2]),
                    calmAfter=calm["rel"], surprise="up" if mean_post >= 0 else "down",
                    events=events)
@@ -613,9 +696,11 @@ def index_analytics():
 log("computing analytics...")
 adir = OUT / "a"
 adir.mkdir(parents=True, exist_ok=True)
+for old in adir.glob("*.json"):
+    old.unlink()
 n_analytics = 0
 analytics_ids = set()
-for k, s in enumerate(universe):
+for k, s in enumerate(combined):
     try:
         a = analytics_for(s)
     except Exception as e:
@@ -627,14 +712,95 @@ for k, s in enumerate(universe):
                                           encoding="utf-8")
     analytics_ids.add(s["id"])
     n_analytics += 1
-    if k % 200 == 199:
-        log(f"  ...{k + 1}/{len(universe)} ({n_analytics} written)")
+    if k % 500 == 499:
+        log(f"  ...{k + 1}/{len(combined)} ({n_analytics} written)")
 
 idx_a = index_analytics()
 if idx_a is None:
     raise SystemExit("index analytics failed")
 (adir / "OSEBX.json").write_text(json.dumps(idx_a, ensure_ascii=False, allow_nan=False), encoding="utf-8")
 log(f"  analytics written: {n_analytics} instruments + OSEBX index")
+
+# ---------------- 7b. fund NAV seasonality (Yahoo lookup by ISIN) ----------------
+n_funds_season = 0
+
+
+def fetch_fund_seasonality():
+    global n_funds_season
+    cand = sorted([fd for fd in funds if fd["isin"] and (fd["px"] or 0) > 0],
+                  key=lambda x: x["owners"] or 0, reverse=True)[:FUND_HIST_MAX]
+    log(f"fund seasonality: resolving {len(cand)} ISINs on Yahoo...")
+    sym_of = {}
+    for k, fd in enumerate(cand):
+        try:
+            qs = yf.Search(fd["isin"], max_results=1).quotes
+            if qs and qs[0].get("symbol"):
+                sym_of[fd["id"]] = qs[0]["symbol"]
+        except Exception as e:
+            if "429" in str(e) or "Too Many" in str(e):
+                log("  429 on ISIN search — backing off 60s")
+                time.sleep(60)
+        time.sleep(0.25)
+        if k % 50 == 49:
+            log(f"  ...{k + 1}/{len(cand)} ({len(sym_of)} resolved)")
+    log(f"  resolved {len(sym_of)}; downloading monthly NAVs...")
+    fd_by_id = {fd["id"]: fd for fd in cand}
+    ids = list(sym_of.keys())
+    chunk = 50
+    for i in range(0, len(ids), chunk):
+        part = ids[i:i + chunk]
+        ts = [sym_of[j] for j in part]
+        try:
+            h = yf.download(ts, period="10y", interval="1mo", auto_adjust=True,
+                            progress=False, threads=True, group_by="column")["Close"]
+        except Exception as e:
+            log(f"  fund chunk failed: {e}")
+            continue
+        if h is None or h.empty:
+            continue
+        if not hasattr(h, "columns"):
+            h = h.to_frame(name=ts[0])
+        for j in part:
+            t = sym_of[j]
+            if t not in h.columns:
+                continue
+            col = h[t].dropna()
+            fd = fd_by_id[j]
+            if len(col) < 25:
+                continue
+            last = float(col.iloc[-1])
+            if last <= 0 or abs(last / fd["px"] - 1) > 0.15:
+                continue  # wrong share class / ccy mismatch
+            rr = col.pct_change().dropna().tail(120)
+            rr = rr[np.abs(rr) < 0.5]
+            if len(rr) < 25:
+                continue
+            rows = bucket_stats(rr.values, np.zeros(len(rr)), rr.index.month.values,
+                                list(range(1, 13)))
+            for ii, row in enumerate(rows):
+                row["key"] = MONTHS[ii]
+            vals = rr.values
+            m3 = float((np.prod(1 + vals[-3:]) - 1) * 100) if len(vals) >= 3 else 0.0
+            m12 = float((np.prod(1 + vals[-12:]) - 1) * 100) if len(vals) >= 12 else 0.0
+            a = dict(
+                instrument=dict(id=fd["id"], name=fd["name"], ticker=None, kind="fund",
+                                currency=fd["ccy"], country=None, tz=None,
+                                slug=fd["slug"], owners=fd["owners"] or 0),
+                asOf=NOW.date().isoformat(),
+                momentum=dict(m3=round(m3, 1), m12=round(m12, 1)),
+                monthsAxis=MONTHS,
+                years=round(len(rr) / 12, 1),
+                month=rows,
+            )
+            (adir / f"{fd['id']}.json").write_text(
+                json.dumps(a, ensure_ascii=False, allow_nan=False), encoding="utf-8")
+            analytics_ids.add(fd["id"])
+            n_funds_season += 1
+        time.sleep(1)
+    log(f"  fund seasonality written: {n_funds_season} funds")
+
+
+fetch_fund_seasonality()
 
 # ---------------- 8. catalog + shards ----------------
 catalog = [dict(id="OSEBX", sym="OSEBX", name="Oslo Børs Benchmark", type="IDX",
@@ -647,7 +813,8 @@ for s in shares:
 for fd in funds:
     catalog.append(dict(id=fd["id"], sym=None, name=fd["name"], type="FND",
                         cat=fd["cat"], ccy=fd["ccy"], px=fd["px"], chg=fd["chg"],
-                        owners=fd["owners"], isin=fd["isin"], hasA=0))
+                        owners=fd["owners"], isin=fd["isin"],
+                        hasA=1 if fd["id"] in analytics_ids else 0))
 for e in etfs:
     catalog.append(dict(id=e["id"], sym=e["sym"], name=e["name"], type="ETF",
                         cat=f"ETF · {e['cat']}", ccy=e["ccy"], px=e["px"], chg=e["chg"],
@@ -679,8 +846,9 @@ for i, sh in enumerate(shard_data):
 (OUT / "meta.json").write_text(json.dumps(dict(
     asOf=NOW.date().isoformat(),
     counts=dict(shares=len(shares), funds=len(funds), etfs=len(etfs),
-                analytics=n_analytics + 1, withEarnings=len(earn_dates)),
+                analytics=n_analytics + 1, fundSeasonality=n_funds_season,
+                withEarnings=len(earn_dates)),
 ), ensure_ascii=False), encoding="utf-8")
 
-log(f"\nDONE: catalog {len(catalog)} · analytics {n_analytics + 1} · "
-    f"shards {SHARDS} · earnings {len(earn_dates)}")
+log(f"\nDONE: catalog {len(catalog)} · analytics {n_analytics + 1} stocks/ETFs + "
+    f"{n_funds_season} funds · shards {SHARDS} · earnings {len(earn_dates)}")
