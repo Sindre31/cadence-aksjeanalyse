@@ -366,6 +366,25 @@ if len(missing) > 20:
         dl_daily(missing[i:i + 200], "repair")
 log(f"  daily history: {len(daily_px)} tickers")
 
+# backfill px/chg from Yahoo daily closes where Nordnet has no last price —
+# price_info.last is 0 on realtime-restricted venues (most Oslo Børs majors,
+# Stockholm, Toronto, Paris…). Skip GB/IE: Yahoo quotes those in pence.
+n_pxfill = 0
+for s in shares + etfs:
+    if (s["px"] or 0) > 0 or s["country"] in ("GB", "IE"):
+        continue
+    col = daily_px.get(s["yt"])
+    if col is None or len(col) < 2:
+        continue
+    last, prev = float(col.iloc[-1]), float(col.iloc[-2])
+    if last <= 0:
+        continue
+    s["px"] = f(last)
+    if s["chg"] is None and prev > 0:
+        s["chg"] = f((last / prev - 1) * 100)
+    n_pxfill += 1
+log(f"  px/chg backfilled from Yahoo: {n_pxfill} instruments")
+
 # ---------------- 5. earnings dates ----------------
 log("fetching earnings dates...")
 earn_dates = {}   # yt -> sorted list of pd.Timestamp (dates, naive)
