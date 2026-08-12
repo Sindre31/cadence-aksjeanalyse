@@ -49,12 +49,13 @@ src/App.jsx            dashboard, picker, hero, earnings, fund summary view
 src/charts.jsx         heatmap, bars, columns, intraday curve, gauge, earnings drift
 src/datasource.js      catalog/analytics/shard loaders + view builder
 src/styles.css         design system (Space Grotesk + IBM Plex, CSS variables)
-scripts/fetch_data.py  Nordnet + Yahoo importer
+scripts/fetch_data.py    Nordnet + Yahoo importer (full corpus)
+scripts/update_prices.py price-only top-up (quotes, no analytics)
 public/data/
   catalog.json         search index — all Nordnet instruments
   a/<id>.json          timing analytics per instrument (analytics universe)
   s/<n>.json           256 detail shards — every instrument (id % 256)
-  meta.json            asOf + counts
+  meta.json            asOf + counts + pricesAsOf
 ```
 
 ## Data
@@ -76,9 +77,29 @@ public/data/
 
 ### Refresh
 
+Two cadences, because the two halves of the dataset age at very different
+speeds. Weekday/hour edges are built from years of bars and barely move week to
+week; quotes go stale the same afternoon.
+
+| | Job | Schedule | Runtime |
+|---|---|---|---|
+| Full corpus | `.github/workflows/refresh-data.yml` → `fetch_data.py` | Sat 03:45 UTC | ~50 min |
+| Prices only | `.github/workflows/update-prices.yml` → `update_prices.py` | Mon–Fri 06:00 + 16:00 UTC | ~5 min |
+
+The price job runs before the Oslo open and after the close, updates only
+`px`/`chg` in the catalog and shards, and leaves analytics untouched. New
+listings are picked up by the weekly full run. Both jobs share a `cadence-data`
+concurrency group so they never race each other's push.
+
+Yahoo throttles shared CI egress hard, so the full run is written to survive a
+partial download: if the intraday bars for the index go missing, the previous
+committed heatmap is carried over (flagged with `matrixAsOf`) rather than
+failing a completed 50-minute run.
+
 ```sh
 python3 -m venv .venv && .venv/bin/pip install yfinance numpy pandas lxml
-.venv/bin/python scripts/fetch_data.py
+.venv/bin/python scripts/fetch_data.py      # everything
+.venv/bin/python scripts/update_prices.py   # quotes only
 ```
 
 ## Run locally

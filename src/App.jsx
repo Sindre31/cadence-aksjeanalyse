@@ -398,6 +398,9 @@ export default function App() {
   const report = view && reportFlag(view);
   const asOfIso = (view && view.asOf) || (meta && meta.asOf);
   const asOf = asOfIso && new Date(asOfIso).toLocaleDateString('en-GB', { day: '2-digit', month: 'short', year: 'numeric' });
+  // analytics refresh weekly, prices twice per trading day — show both
+  const pricesAsOf = meta && meta.pricesAsOf
+    && new Date(meta.pricesAsOf).toLocaleString('en-GB', { day: '2-digit', month: 'short', hour: '2-digit', minute: '2-digit' });
 
   return (
     <div className={'app' + (loading ? ' loading' : '')}>
@@ -421,7 +424,9 @@ export default function App() {
         </div>
         <div className="topbar-right">
           <span className="live-dot"></span>
-          <span className="asof">data as of {asOf || '—'}</span>
+          <span className="asof" title={pricesAsOf ? `prices updated ${pricesAsOf}` : undefined}>
+            data as of {asOf || '—'}{pricesAsOf ? ` · prices ${pricesAsOf}` : ''}
+          </span>
           <button className="theme-btn" title="Switch theme"
                   onClick={() => setTheme(THEME_ORDER[(THEME_ORDER.indexOf(theme) + 1) % THEME_ORDER.length])}>
             ◐ {THEMES[theme].label}

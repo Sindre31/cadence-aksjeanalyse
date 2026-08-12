@@ -769,11 +769,42 @@ def earnings_for(s, px, dr):
 
 
 # ---------------- 7. index analytics + reporting season ----------------
+def carry_over_index(a, prev):
+    """Reuse the previous run's index heatmap when Yahoo dropped the hourly bars.
+
+    The day x hour matrix needs intraday bars for a single ticker, so one
+    throttled request used to sink the whole refresh. The daily buckets are
+    fresh either way — an intraday matrix that is a few days old is far better
+    than discarding a completed run.
+    """
+    if not prev:
+        return a
+    if not a.get("hoursAxis") and prev.get("hoursAxis"):
+        a["hoursAxis"] = prev["hoursAxis"]
+    stale = []
+    for tf, cur in a["tf"].items():
+        old = (prev.get("tf") or {}).get(tf)
+        if cur.get("matrix") or not (old and old.get("matrix")):
+            continue
+        cur["matrix"] = old["matrix"]
+        cur["hour"] = old.get("hour")
+        cur["intradayDays"] = old.get("intradayDays", 0)
+        rec, orec = cur["recommendation"], old.get("recommendation") or {}
+        rec["bestWindow"] = orec.get("bestWindow", rec["bestWindow"])
+        rec["worstWindow"] = orec.get("worstWindow", rec["worstWindow"])
+        cur["matrixAsOf"] = prev.get("asOf")
+        stale.append(tf)
+    if stale:
+        log(f"  index heatmap carried over from {prev.get('asOf')} ({', '.join(stale)})")
+    return a
+
+
 def index_analytics():
     s = dict(INDEX)
     a = analytics_for(dict(s, kind="index"))
     if a is None:
         return None
+    a = carry_over_index(a, prev_index)
     # reporting season: share of tracked companies reporting per month
     months = np.zeros(12)
     for t, ds in earn_dates.items():
@@ -791,6 +822,12 @@ def index_analytics():
 log("computing analytics...")
 adir = OUT / "a"
 adir.mkdir(parents=True, exist_ok=True)
+# the committed index analytics is the fallback for whatever Yahoo throttles away
+prev_index = None
+try:
+    prev_index = json.loads((adir / "OSEBX.json").read_text(encoding="utf-8"))
+except Exception:
+    pass
 for old in adir.glob("*.json"):
     old.unlink()
 n_analytics = 0
@@ -813,11 +850,16 @@ for k, s in enumerate(combined):
 idx_a = index_analytics()
 if idx_a is None:
     px = daily_px.get(INDEX["yt"])
-    raise SystemExit(
-        f"index analytics failed for {INDEX['yt']}: "
-        f"daily bars={0 if px is None else len(px)} (need 120), "
-        f"hourly={'yes' if INDEX['yt'] in hourly else 'no'} — "
-        "Yahoo most likely rate-limited the run")
+    why = (f"index analytics failed for {INDEX['yt']}: "
+           f"daily bars={0 if px is None else len(px)} (need 120), "
+           f"hourly={'yes' if INDEX['yt'] in hourly else 'no'} — "
+           "Yahoo most likely rate-limited the run")
+    if not prev_index:
+        raise SystemExit(why)
+    log(f"  {why}; keeping the committed index analytics from {prev_index.get('asOf')}")
+    idx_a = prev_index
+    for cur in idx_a.get("tf", {}).values():
+        cur["matrixAsOf"] = idx_a.get("asOf")
 (adir / "OSEBX.json").write_text(json.dumps(idx_a, ensure_ascii=False, allow_nan=False), encoding="utf-8")
 log(f"  analytics written: {n_analytics} instruments + OSEBX index")
 
