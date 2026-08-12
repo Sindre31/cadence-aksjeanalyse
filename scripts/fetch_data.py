@@ -42,6 +42,10 @@ DAILY_ETF_MAX = 800
 EARNINGS_TOP = 500       # most-owned analytics stocks to fetch earnings dates for
 FUND_HIST_MAX = 250      # most-owned funds to resolve monthly NAV history for (via ISIN)
 SHARDS = 256
+# Yahoo throttles hard on shared CI egress. Backing off is the only cure, so the
+# script keeps its own budget: the workflow times out at 110 min, and everything
+# after the downloads (analytics, shards, commit) needs ~10 of those.
+DEADLINE = time.time() + 92 * 60
 DAYS = ["Mon", "Tue", "Wed", "Thu", "Fri"]
 MONTHS = ["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"]
 TFS = {"1Y": 252, "3Y": 756, "5Y": 1260}
@@ -55,6 +59,18 @@ TZ = {"NO": "Europe/Oslo", "SE": "Europe/Stockholm", "DK": "Europe/Copenhagen",
       "BE": "Europe/Brussels", "IT": "Europe/Rome", "ES": "Europe/Madrid",
       "PT": "Europe/Lisbon", "AT": "Europe/Vienna", "CH": "Europe/Zurich",
       "GB": "Europe/London", "IE": "Europe/Dublin"}
+
+
+def time_left():
+    return DEADLINE - time.time()
+
+
+def nap(secs, why):
+    """Sleep, but never past the job's time budget."""
+    s = max(0, min(secs, time_left() - 60))
+    if s > 0:
+        log(f"    {why} — backing off {int(s)}s")
+        time.sleep(s)
 
 
 def log(*a):
@@ -239,15 +255,21 @@ log(f"analytics universe: {len(no_shares)} NO + {len(foreign)} foreign + {len(et
 INDEX = dict(id="OSEBX", sym="OSEBX", name="Oslo Børs Benchmark", country="NO",
              ccy="NOK", kind="index", owners=0, slug=None, yt=None)
 log("picking index ticker...")
-for c in ["OBX.OL", "^OSEAX"]:
-    try:
-        h = yf.download(c, period="1y", interval="1d", auto_adjust=True, progress=False)["Close"].dropna()
-        if len(h) > 150:
-            INDEX["yt"] = c
-            log(f"  index: {c}")
-            break
-    except Exception as e:
-        log(f"  index {c} failed: {e}")
+for attempt in range(4):
+    for c in ["OBX.OL", "^OSEAX"]:
+        try:
+            h = yf.download(c, period="1y", interval="1d", auto_adjust=True, progress=False)["Close"].dropna()
+            if len(h) > 150:
+                INDEX["yt"] = c
+                log(f"  index: {c}")
+                break
+            log(f"  index {c}: {len(h)} bars, too thin")
+        except Exception as e:
+            log(f"  index {c} failed: {e}")
+        time.sleep(2)
+    if INDEX["yt"] or time_left() < 20 * 60:
+        break
+    nap(60 * (attempt + 1), f"no index ticker on pass {attempt + 1}")
 if not INDEX["yt"]:
     raise SystemExit("no index ticker worked")
 
@@ -308,63 +330,114 @@ for country, ts_all in sorted(by_country.items(), key=lambda kv: -len(kv[1])):
 # repair passes: smaller chunks for whatever the throttle dropped
 for rp in range(2):
     missing = [t for t, c in country_of.items() if t not in hourly and TZ.get(c)]
-    if len(missing) < 10:
+    if len(missing) < 10 or time_left() < 45 * 60:
         break
-    log(f"  hourly repair pass {rp + 1}: {len(missing)} missing — backing off 90s")
-    time.sleep(90)
+    log(f"  hourly repair pass {rp + 1}: {len(missing)} missing")
+    nap(90, "hourly repair")
     by_c = {}
     for t in missing:
         by_c.setdefault(country_of[t], []).append(t)
     for country, ts_all in by_c.items():
         for i in range(0, len(ts_all), 40):
             dl_hourly(ts_all[i:i + 40], TZ[country], f"repair {country}")
-log(f"  hourly history: {len(hourly)} tickers")
+
+# the index heatmap is what the quality gate checks, and a single missing ticker
+# never trips the repair pass above — chase it on its own.
+for attempt in range(3):
+    if INDEX["yt"] in hourly or time_left() < 40 * 60:
+        break
+    nap(45 * (attempt + 1), f"index hourly missing (retry {attempt + 1})")
+    dl_hourly([INDEX["yt"]], TZ["NO"], "index")
+log(f"  hourly history: {len(hourly)} tickers"
+    f"{'' if INDEX['yt'] in hourly else ' (index MISSING)'}")
 
 # ---------------- 4. daily history (5y) ----------------
-all_ts = [s["yt"] for s in combined] + [INDEX["yt"]]
-log(f"downloading 5y daily history for {len(all_ts)} tickers...")
+# Priority order matters: the index and the hourly tier download first, so a
+# throttle that sets in mid-run costs us the long tail rather than the heatmap.
+priority_ts, tail_ts, seen_dl = [], [], set()
+for t in [INDEX["yt"]] + [s["yt"] for s in universe]:
+    if t not in seen_dl:
+        seen_dl.add(t)
+        priority_ts.append(t)
+for s in daily_tier:
+    if s["yt"] not in seen_dl:
+        seen_dl.add(s["yt"])
+        tail_ts.append(s["yt"])
+all_ts = priority_ts + tail_ts
+log(f"downloading 5y daily history for {len(all_ts)} tickers "
+    f"({len(priority_ts)} priority + {len(tail_ts)} tail)...")
 daily_px, daily_vol = {}, {}
 
 
-def dl_daily(ts, label):
-    log(f"  daily {label} ({len(ts)})")
-    try:
-        h = yf.download(ts, period="5y", interval="1d", auto_adjust=True,
-                        progress=False, threads=True, group_by="column")
-    except Exception as e:
-        log(f"  chunk failed: {e}")
-        return
-    if h is None or h.empty:
-        return
-    cl = h["Close"] if "Close" in h.columns.get_level_values(0) else None
-    vo = h["Volume"] if "Volume" in h.columns.get_level_values(0) else None
-    if cl is None:
-        return
-    if not hasattr(cl, "columns"):
-        cl = cl.to_frame(name=ts[0])
-        vo = vo.to_frame(name=ts[0]) if vo is not None else None
-    for t in cl.columns:
-        col = cl[t].dropna()
-        if len(col) >= 60:
-            daily_px[t] = col
-            if vo is not None and t in vo.columns:
-                daily_vol[t] = vo[t].reindex(col.index)
+def dl_daily(ts, label, period="5y", tries=2):
+    """Download a chunk. Returns how many tickers it added to daily_px."""
+    before = len(daily_px)
+    h = None
+    for attempt in range(tries):
+        try:
+            h = yf.download(ts, period=period, interval="1d", auto_adjust=True,
+                            progress=False, threads=True, group_by="column")
+            break
+        except Exception as e:
+            log(f"  chunk {label} failed: {e}")
+            h = None
+            if attempt + 1 < tries:
+                nap(30 * (attempt + 1), "chunk retry")
+    if h is not None and not h.empty:
+        cl = h["Close"] if "Close" in h.columns.get_level_values(0) else None
+        vo = h["Volume"] if "Volume" in h.columns.get_level_values(0) else None
+        if cl is not None:
+            if not hasattr(cl, "columns"):
+                cl = cl.to_frame(name=ts[0])
+                vo = vo.to_frame(name=ts[0]) if vo is not None else None
+            for t in cl.columns:
+                col = cl[t].dropna()
+                if len(col) >= 60:
+                    daily_px[t] = col
+                    if vo is not None and t in vo.columns:
+                        daily_vol[t] = vo[t].reindex(col.index)
+    got = len(daily_px) - before
+    log(f"  daily {label} ({len(ts)}) -> {got}")
     time.sleep(1)
+    return got
 
 
-CH = 400
+CH = 300
+cool = 0    # extra pacing, doubled every throttled chunk, cleared on a good one
 for i in range(0, len(all_ts), CH):
-    dl_daily(all_ts[i:i + CH], f"chunk {i // CH + 1}/{(len(all_ts) + CH - 1) // CH}")
+    chunk = all_ts[i:i + CH]
+    got = dl_daily(chunk, f"chunk {i // CH + 1}/{(len(all_ts) + CH - 1) // CH}")
+    if got < len(chunk) * 0.5:
+        cool = min(120, cool * 2 or 20)
+        nap(cool, f"low yield {got}/{len(chunk)}")
+    else:
+        cool = 0
 
-# one repair pass — hourly-tier tickers first, they carry the heatmap
-missing = ([t for t in ([s["yt"] for s in universe] + [INDEX["yt"]]) if t not in daily_px]
-           + [s["yt"] for s in daily_tier if s["yt"] not in daily_px])
-if len(missing) > 20:
-    log(f"  daily repair pass: {len(missing)} missing — backing off 60s")
-    time.sleep(60)
-    for i in range(0, len(missing), 200):
-        dl_daily(missing[i:i + 200], "repair")
-log(f"  daily history: {len(daily_px)} tickers")
+# repair passes — priority tickers first, escalating backoff, bounded by the
+# time budget so a throttled night still commits whatever it did manage to get
+for rp in range(3):
+    missing = ([t for t in priority_ts if t not in daily_px]
+               + [t for t in tail_ts if t not in daily_px])
+    if len(missing) < 20 or time_left() < 25 * 60:
+        break
+    log(f"  daily repair pass {rp + 1}: {len(missing)} missing")
+    nap(90 * (rp + 1), "daily repair")
+    for i in range(0, len(missing), 150):
+        if time_left() < 20 * 60:
+            log("  repair stopped: out of time budget")
+            break
+        dl_daily(missing[i:i + 150], f"repair {rp + 1}", tries=1)
+
+# OSEBX gates the whole refresh (see index_analytics) — chase it alone, and fall
+# back to shorter windows, since a 1y series still carries every timeframe's
+# weekday/month buckets and the heatmap comes from the hourly bars regardless.
+for attempt, period in enumerate(["5y", "5y", "2y", "1y"]):
+    if INDEX["yt"] in daily_px or time_left() < 15 * 60:
+        break
+    nap(60 * (attempt + 1), f"index daily missing (retry {attempt + 1}, {period})")
+    dl_daily([INDEX["yt"]], "index", period=period, tries=1)
+log(f"  daily history: {len(daily_px)} tickers"
+    f"{'' if INDEX['yt'] in daily_px else ' (index MISSING)'}")
 
 # backfill px/chg from Yahoo daily closes where Nordnet has no last price —
 # price_info.last is 0 on realtime-restricted venues (most Oslo Børs majors,
@@ -391,6 +464,9 @@ earn_dates = {}   # yt -> sorted list of pd.Timestamp (dates, naive)
 earn_targets = sorted([s for s in universe if s["kind"] == "stock"],
                       key=lambda s: (s["owners"] or 0), reverse=True)[:EARNINGS_TOP]
 for k, s in enumerate(earn_targets):
+    if time_left() < 12 * 60:
+        log(f"  earnings stopped at {k}/{len(earn_targets)}: out of time budget")
+        break
     t = s["yt"]
     try:
         ed = yf.Ticker(t).get_earnings_dates(limit=16)
@@ -736,7 +812,12 @@ for k, s in enumerate(combined):
 
 idx_a = index_analytics()
 if idx_a is None:
-    raise SystemExit("index analytics failed")
+    px = daily_px.get(INDEX["yt"])
+    raise SystemExit(
+        f"index analytics failed for {INDEX['yt']}: "
+        f"daily bars={0 if px is None else len(px)} (need 120), "
+        f"hourly={'yes' if INDEX['yt'] in hourly else 'no'} — "
+        "Yahoo most likely rate-limited the run")
 (adir / "OSEBX.json").write_text(json.dumps(idx_a, ensure_ascii=False, allow_nan=False), encoding="utf-8")
 log(f"  analytics written: {n_analytics} instruments + OSEBX index")
 
@@ -751,6 +832,9 @@ def fetch_fund_seasonality():
     log(f"fund seasonality: resolving {len(cand)} ISINs on Yahoo...")
     sym_of = {}
     for k, fd in enumerate(cand):
+        if time_left() < 8 * 60:
+            log(f"  ISIN resolve stopped at {k}/{len(cand)}: out of time budget")
+            break
         try:
             qs = yf.Search(fd["isin"], max_results=1).quotes
             if qs and qs[0].get("symbol"):
