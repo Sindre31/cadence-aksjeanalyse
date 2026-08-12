@@ -55,6 +55,7 @@ public/data/
   catalog.json         search index — all Nordnet instruments
   a/<id>.json          timing analytics per instrument (analytics universe)
   s/<n>.json           256 detail shards — every instrument (id % 256)
+  prices.json          {id: [px, chg]} — the only file the price job rewrites
   meta.json            asOf + counts + pricesAsOf
 ```
 
@@ -86,10 +87,15 @@ week; quotes go stale the same afternoon.
 | Full corpus | `.github/workflows/refresh-data.yml` → `fetch_data.py` | Sat 03:45 UTC | ~50 min |
 | Prices only | `.github/workflows/update-prices.yml` → `update_prices.py` | Mon–Fri 06:00 + 16:00 UTC | ~5 min |
 
-The price job runs before the Oslo open and after the close, updates only
-`px`/`chg` in the catalog and shards, and leaves analytics untouched. New
-listings are picked up by the weekly full run. Both jobs share a `cadence-data`
-concurrency group so they never race each other's push.
+The price job runs before the Oslo open and after the close and leaves analytics
+untouched. New listings are picked up by the weekly full run. Both jobs share a
+`cadence-data` concurrency group so they never race each other's push.
+
+Quotes live in `prices.json` and nowhere else. Carrying them in `catalog.json`
+and the 256 shards as well meant every price run rewrote the whole corpus —
+3.6 MB of git history per run, twice a trading day, on a repo already past
+200 MB. One file makes it ~25× smaller, and drops the price fields from the 3 MB
+catalog every visitor downloads.
 
 Yahoo throttles shared CI egress hard, so the full run is written to survive a
 partial download: if the intraday bars for the index go missing, the previous

@@ -39,8 +39,10 @@ jobs:
           from pathlib import Path
           cat = json.loads(Path("public/data/catalog.json").read_text())
           meta = json.loads(Path("public/data/meta.json").read_text())
+          px = json.loads(Path("public/data/prices.json").read_text())
           a = list(Path("public/data/a").glob("*.json"))
           assert len(cat) > 10000, f"catalog too thin: {len(cat)}"
+          assert len(px["p"]) > 5000, f"too few priced instruments: {len(px['p'])}"
           assert meta["counts"]["funds"] > 500, "funds missing"
           assert len(a) > 400, f"analytics too thin: {len(a)}"
           assert Path("public/data/a/OSEBX.json").exists(), "index analytics missing"
