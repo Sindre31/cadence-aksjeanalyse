@@ -1,12 +1,19 @@
 name: Refresh market data
 
+# The heavy one: full catalog + timing analytics for ~5000 instruments, ~50 min
+# of Yahoo bandwidth. Weekday/hour edges move slowly, so weekly is plenty —
+# update-prices.yml keeps the quotes fresh between runs.
 on:
   schedule:
-    - cron: "45 3 * * 2-6"   # Tue–Sat 03:45 UTC, after Oslo close data settles
+    - cron: "45 3 * * 6"   # Saturday 03:45 UTC, with the week's sessions settled
   workflow_dispatch:
 
 permissions:
   contents: write
+
+concurrency:
+  group: cadence-data
+  cancel-in-progress: false
 
 jobs:
   refresh:
@@ -38,7 +45,11 @@ jobs:
           assert len(a) > 400, f"analytics too thin: {len(a)}"
           assert Path("public/data/a/OSEBX.json").exists(), "index analytics missing"
           osebx = json.loads(Path("public/data/a/OSEBX.json").read_text())
-          assert osebx["tf"].get("3Y", {}).get("matrix"), "index heatmap missing"
+          tf3 = osebx["tf"].get("3Y", {})
+          assert tf3.get("matrix"), "index heatmap missing"
+          if tf3.get("matrixAsOf"):
+              print(f"WARNING: index heatmap carried over from {tf3['matrixAsOf']} "
+                    "— Yahoo dropped the intraday bars this run")
           print(f"OK: catalog {len(cat)}, analytics {len(a)}")
           EOF
 
@@ -48,5 +59,9 @@ jobs:
           git config user.email "github-actions[bot]@users.noreply.github.com"
           git add public/data
           git diff --cached --quiet && echo "no changes" && exit 0
-          git commit -m "data: nightly refresh $(date -u +%F)"
-          git push
+          git commit -m "data: weekly refresh $(date -u +%F)"
+          for i in 1 2 3; do
+            git pull --rebase origin ${{ github.ref_name }} && git push && exit 0
+            sleep $((i * 5))
+          done
+          exit 1
