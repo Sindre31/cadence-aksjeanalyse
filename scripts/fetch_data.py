@@ -948,21 +948,24 @@ def fetch_fund_seasonality():
 fetch_fund_seasonality()
 
 # ---------------- 8. catalog + shards ----------------
+# px/chg live in prices.json alone, not here and not in the shards: quotes are
+# rewritten twice a trading day, and duplicating them into 3 MB of catalog plus
+# 8 MB of shards made every price commit ~3.6 MB of git history.
 catalog = [dict(id="OSEBX", sym="OSEBX", name="Oslo Børs Benchmark", type="IDX",
-                cat="Index · Oslo", ccy="NOK", px=None, chg=None, owners=10**9, hasA=1)]
+                cat="Index · Oslo", ccy="NOK", owners=10**9, hasA=1)]
 for s in shares:
     catalog.append(dict(id=s["id"], sym=s["sym"], name=s["name"], type="EQ",
-                        cat=f"Aksje · {s['exch']}", ccy=s["ccy"], px=s["px"], chg=s["chg"],
+                        cat=f"Aksje · {s['exch']}", ccy=s["ccy"],
                         owners=s["owners"], isin=s["isin"],
                         hasA=1 if s["id"] in analytics_ids else 0))
 for fd in funds:
     catalog.append(dict(id=fd["id"], sym=None, name=fd["name"], type="FND",
-                        cat=fd["cat"], ccy=fd["ccy"], px=fd["px"], chg=fd["chg"],
+                        cat=fd["cat"], ccy=fd["ccy"],
                         owners=fd["owners"], isin=fd["isin"],
                         hasA=1 if fd["id"] in analytics_ids else 0))
 for e in etfs:
     catalog.append(dict(id=e["id"], sym=e["sym"], name=e["name"], type="ETF",
-                        cat=f"ETF · {e['cat']}", ccy=e["ccy"], px=e["px"], chg=e["chg"],
+                        cat=f"ETF · {e['cat']}", ccy=e["ccy"],
                         owners=e["owners"], isin=e["isin"],
                         hasA=1 if e["id"] in analytics_ids else 0))
 
@@ -972,24 +975,35 @@ shard_data = [dict() for _ in range(SHARDS)]
 for s in shares:
     shard_data[s["id"] % SHARDS][str(s["id"])] = dict(
         id=s["id"], sym=s["sym"], name=s["name"], type="EQ", cat=f"Aksje · {s['exch']}",
-        ccy=s["ccy"], isin=s["isin"], px=s["px"], chg=s["chg"], owners=s["owners"],
+        ccy=s["ccy"], isin=s["isin"], owners=s["owners"],
         slug=s["slug"], y=s["y"], ratios=dict(pe=s["pe"], pb=s["pb"], ps=s["ps"], div=s["div"]))
 for fd in funds:
     shard_data[fd["id"] % SHARDS][str(fd["id"])] = dict(
         id=fd["id"], name=fd["name"], type="FND", cat=fd["cat"], ccy=fd["ccy"],
-        isin=fd["isin"], px=fd["px"], chg=fd["chg"], owners=fd["owners"],
+        isin=fd["isin"], owners=fd["owners"],
         slug=fd["slug"], y=fd["y"], fund=fd["fund"])
 for e in etfs:
     shard_data[e["id"] % SHARDS][str(e["id"])] = dict(
         id=e["id"], sym=e["sym"], name=e["name"], type="ETF", cat=f"ETF · {e['cat']}",
-        ccy=e["ccy"], isin=e["isin"], px=e["px"], chg=e["chg"], owners=e["owners"],
+        ccy=e["ccy"], isin=e["isin"], owners=e["owners"],
         slug=e["slug"], y=e["y"], fund=e["fund"])
 for i, sh in enumerate(shard_data):
     (sdir / f"{i}.json").write_text(json.dumps(sh, ensure_ascii=False, allow_nan=False), encoding="utf-8")
 
 (OUT / "catalog.json").write_text(json.dumps(catalog, ensure_ascii=False, allow_nan=False), encoding="utf-8")
+
+# prices.json — the only file the twice-daily price job rewrites: {id: [px, chg]}
+prices_at = dt.datetime.now(dt.timezone.utc).replace(microsecond=0).isoformat()
+prices = {str(r["id"]): [r["px"], r["chg"]] for r in shares + funds + etfs
+          if (r["px"] or 0) > 0}
+(OUT / "prices.json").write_text(json.dumps(dict(asOf=prices_at, p=prices),
+                                            ensure_ascii=False, allow_nan=False),
+                                 encoding="utf-8")
+log(f"  prices.json: {len(prices)} quotes")
 (OUT / "meta.json").write_text(json.dumps(dict(
     asOf=NOW.date().isoformat(),
+    pricesAsOf=prices_at,
+    pricesUpdated=len(prices),
     counts=dict(shares=len(shares), funds=len(funds), etfs=len(etfs),
                 analytics=n_analytics + 1, fundSeasonality=n_funds_season,
                 withEarnings=len(earn_dates)),

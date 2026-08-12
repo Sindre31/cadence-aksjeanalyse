@@ -4,11 +4,14 @@
 The full refresh (scripts/fetch_data.py) rebuilds the whole analytics corpus and
 takes ~50 minutes of Yahoo bandwidth, so it runs weekly. Prices go stale much
 faster than weekday/hour edges do, so this script tops up just the quotes —
-around 2-5 minutes, no analytics touched:
+around 4 minutes, and it writes exactly two files:
 
-  public/data/catalog.json   px / chg per instrument (search + picker)
-  public/data/s/<n>.json     px / chg in the detail shards
-  public/data/meta.json      pricesAsOf timestamp + how many rows moved
+  public/data/prices.json    {id: [px, chg]} for every priced instrument
+  public/data/meta.json      pricesAsOf timestamp + how many quotes moved
+
+Quotes live in prices.json alone, and nowhere else. Carrying them in
+catalog.json and the 256 detail shards as well cost ~3.6 MB of git history per
+run, twice a trading day; this one file is ~25x smaller.
 
 Prices come from Nordnet. The venues Nordnet does not stream to logged-out
 clients (most Oslo Bors majors, Stockholm, Toronto, Paris) report last = 0, so
@@ -30,10 +33,12 @@ OUT = ROOT / "public" / "data"
 NN = "https://www.nordnet.no/api/2"
 HDRS = {"Accept": "application/json", "client-id": "NEXT",
         "User-Agent": "Mozilla/5.0 (compatible; cadence/1.0; personal project)"}
-SHARDS = 256
-YAHOO_CHUNK = 200
-# the workflow times out at 25 min; leave room to write files and push
-DEADLINE = time.time() + 16 * 60
+# small chunks on purpose: the time budget is only checked between them, and a
+# throttled 200-ticker chunk can sit in yfinance's internal retries for tens of
+# minutes — long enough for the 25-minute job timeout to kill the run before it
+# commits anything
+YAHOO_CHUNK = 60
+YAHOO_BUDGET = 8 * 60
 
 YSUF = {"NO": ".OL", "SE": ".ST", "DK": ".CO", "FI": ".HE", "DE": ".DE", "US": "",
         "CA": ".TO", "FR": ".PA", "NL": ".AS", "BE": ".BR", "IT": ".MI", "ES": ".MC",
@@ -93,8 +98,14 @@ def price_of(r):
 
 # ---------------- 1. what we already publish ----------------
 catalog = json.loads((OUT / "catalog.json").read_text(encoding="utf-8"))
-cat_by_id = {str(c["id"]): c for c in catalog}
-log(f"catalog: {len(catalog)} instruments")
+known = {str(c["id"]): c for c in catalog}
+try:
+    prev = json.loads((OUT / "prices.json").read_text(encoding="utf-8")).get("p", {})
+except FileNotFoundError:
+    # first run after the split — seed from whatever the catalog still carries
+    prev = {str(c["id"]): [c["px"], c.get("chg")] for c in catalog if c.get("px")}
+    log("  no prices.json yet — seeding from catalog")
+log(f"catalog: {len(catalog)} instruments · {len(prev)} known quotes")
 
 # ---------------- 2. Nordnet quotes ----------------
 quotes = {}   # str(id) -> dict(px, chg, sym, country)
@@ -122,7 +133,7 @@ if n_live < 2000:
 # bandwidth here, and GB/IE are skipped because Yahoo quotes those in pence
 need = {}   # yahoo ticker -> [ids]
 for cid, q in quotes.items():
-    c = cat_by_id.get(cid)
+    c = known.get(cid)
     if c is None or not c.get("hasA") or (q["px"] or 0) > 0:
         continue
     if q["country"] in ("GB", "IE"):
@@ -134,6 +145,7 @@ for cid, q in quotes.items():
 n_yahoo = 0
 if need:
     tickers = sorted(need)
+    deadline = time.time() + YAHOO_BUDGET
     log(f"Yahoo close fallback for {len(tickers)} tickers...")
     try:
         import yfinance as yf
@@ -141,7 +153,7 @@ if need:
         tickers = []
         log("  yfinance not installed — skipping fallback")
     for i in range(0, len(tickers), YAHOO_CHUNK):
-        if time.time() > DEADLINE:
+        if time.time() > deadline:
             log(f"  stopped at {i}/{len(tickers)}: out of time budget")
             break
         part = tickers[i:i + YAHOO_CHUNK]
@@ -166,8 +178,8 @@ if need:
                 continue
             chg = None
             if len(col) >= 2:
-                prev = float(col.iloc[-2])
-                chg = f((last / prev - 1) * 100) if prev > 0 else None
+                prv = float(col.iloc[-2])
+                chg = f((last / prv - 1) * 100) if prv > 0 else None
             for cid in need.get(t, []):
                 quotes[cid]["px"] = f(last)
                 if quotes[cid]["chg"] is None:
@@ -176,52 +188,33 @@ if need:
         time.sleep(1)
     log(f"  filled {n_yahoo} instruments from Yahoo closes")
 
-# ---------------- 4. write catalog + the shards that moved ----------------
-n_cat, n_unknown = 0, 0
+# ---------------- 4. merge and write ----------------
+prices, n_moved, n_unknown = dict(prev), 0, 0
 for cid, q in quotes.items():
-    c = cat_by_id.get(cid)
-    if c is None:
+    if cid not in known:
         n_unknown += 1
         continue
-    px = q["px"] if (q["px"] or 0) > 0 else None
-    if px is None:
+    if (q["px"] or 0) <= 0:
         continue          # keep the last known price rather than blanking it
-    if c.get("px") != px or c.get("chg") != q["chg"]:
-        c["px"], c["chg"] = px, q["chg"]
-        n_cat += 1
+    row = [q["px"], q["chg"]]
+    if prices.get(cid) != row:
+        prices[cid] = row
+        n_moved += 1
 
 # a run between sessions (Monday morning after Friday's close) legitimately moves
 # nothing — leave the tree untouched so the workflow commits nothing and passes
-if n_cat == 0:
+if n_moved == 0:
     log("DONE: no price changed since the last run")
     raise SystemExit(0)
 
-sdir = OUT / "s"
-n_shard, touched = 0, set()
-for n in range(SHARDS):
-    p = sdir / f"{n}.json"
-    if not p.exists():
-        continue
-    sh = json.loads(p.read_text(encoding="utf-8"))
-    dirty = False
-    for cid, row in sh.items():
-        c = cat_by_id.get(cid)
-        if c is None:
-            continue
-        if row.get("px") != c.get("px") or row.get("chg") != c.get("chg"):
-            row["px"], row["chg"] = c.get("px"), c.get("chg")
-            dirty, n_shard = True, n_shard + 1
-    if dirty:
-        p.write_text(json.dumps(sh, ensure_ascii=False, allow_nan=False), encoding="utf-8")
-        touched.add(n)
-
-(OUT / "catalog.json").write_text(json.dumps(catalog, ensure_ascii=False, allow_nan=False),
-                                  encoding="utf-8")
-
+now = dt.datetime.now(dt.timezone.utc).replace(microsecond=0).isoformat()
+(OUT / "prices.json").write_text(json.dumps(dict(asOf=now, p=prices),
+                                            ensure_ascii=False, allow_nan=False),
+                                 encoding="utf-8")
 meta = json.loads((OUT / "meta.json").read_text(encoding="utf-8"))
-meta["pricesAsOf"] = dt.datetime.now(dt.timezone.utc).replace(microsecond=0).isoformat()
-meta["pricesUpdated"] = n_cat
+meta["pricesAsOf"] = now
+meta["pricesUpdated"] = n_moved
 (OUT / "meta.json").write_text(json.dumps(meta, ensure_ascii=False), encoding="utf-8")
 
-log(f"\nDONE: {n_cat} catalog prices · {n_shard} shard rows in {len(touched)} shards · "
-    f"{n_yahoo} from Yahoo · {n_unknown} instruments not in the catalog yet")
+log(f"\nDONE: {n_moved} quotes moved · {len(prices)} priced · {n_yahoo} from Yahoo · "
+    f"{n_unknown} instruments not in the catalog yet")

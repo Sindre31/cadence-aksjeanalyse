@@ -6,13 +6,16 @@
      /data/a/<id>.json   — timing analytics (weekday/hour/month edges, day×hour
                            matrix, earnings, recommendation) per timeframe
      /data/s/<n>.json    — 256 detail shards for ALL instruments (id % 256)
-     /data/meta.json     — asOf + counts
+     /data/prices.json   — {id: [px, chg]}, rewritten twice per trading day by
+                           scripts/update_prices.py; the shards carry no quotes
+     /data/meta.json     — asOf + counts + pricesAsOf
    ============================================================================ */
 
 const SHARDS = 256;
 
 let _catalog = null;
 let _catalogPromise = null;
+let _pricesPromise = null;
 const _aCache = new Map();
 const _shardCache = new Map();
 
@@ -45,6 +48,15 @@ export async function fetchAnalytics(id) {
   }
 }
 
+/* quotes live apart from the shards so the twice-daily price job rewrites one
+   small file instead of the whole corpus — a stale build without it still works */
+function loadPrices() {
+  if (!_pricesPromise) {
+    _pricesPromise = getJSON('/data/prices.json').then(p => p.p || {}).catch(() => ({}));
+  }
+  return _pricesPromise;
+}
+
 export async function fetchDetail(id) {
   if (id === 'OSEBX') return null;
   const shard = Number(id) % SHARDS;
@@ -53,7 +65,10 @@ export async function fetchDetail(id) {
     sh = await getJSON(`/data/s/${shard}.json`);
     _shardCache.set(shard, sh);
   }
-  return sh[String(id)] || null;
+  const row = sh[String(id)];
+  if (!row) return null;
+  const quote = (await loadPrices())[String(id)];
+  return quote ? { ...row, px: quote[0], chg: quote[1] } : row;
 }
 
 /* ---- catalog search: relevance, then Nordnet owner count ------------------ */

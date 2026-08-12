@@ -38,11 +38,16 @@ jobs:
           import json
           from pathlib import Path
           cat = json.loads(Path("public/data/catalog.json").read_text())
+          px = json.loads(Path("public/data/prices.json").read_text())
           meta = json.loads(Path("public/data/meta.json").read_text())
-          priced = sum(1 for c in cat if c.get("px"))
+          known = {str(c["id"]) for c in cat}
+          priced = px["p"]
           assert len(cat) > 10000, f"catalog too thin: {len(cat)}"
-          assert priced > 5000, f"too few priced instruments: {priced}"
-          print(f"OK: {len(cat)} instruments, {priced} priced, "
+          assert len(priced) > 5000, f"too few priced instruments: {len(priced)}"
+          assert all(v[0] and v[0] > 0 for v in priced.values()), "zero/None price published"
+          orphans = [k for k in priced if k not in known]
+          assert not orphans, f"{len(orphans)} quotes for instruments not in the catalog"
+          print(f"OK: {len(cat)} instruments, {len(priced)} priced, "
                 f"prices as of {meta.get('pricesAsOf', 'n/a')}")
           EOF
 
